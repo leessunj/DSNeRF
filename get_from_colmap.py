@@ -85,8 +85,9 @@ def from_images(filepath,img_num):
     np.save(f'{filepath}/point2s.npy', points2d)
 
     print(len(points2d.keys()),len(points2d[2]),points2d[2])
-    # print(points2d[4][616], points2d[5][2224], points2d[3][597], points2d[1][5411], points2d[2][4876],points2d[15][10351])
-filepath="data/comb_d/"
+
+target="comb"
+filepath=f"data/{target}/"
 # from_images("data/comb_d/",14)
 # from_points("data/comb_d/")
 read_images_txt(f'{filepath}images.txt')

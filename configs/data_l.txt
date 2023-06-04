@@ -1,0 +1,21 @@
+#not colmap, only lidar
+expname = data_lidar_only
+basedir = ./logs/result_buz
+datadir = ./data/buz2
+dataset_type = llff
+factor = 8 #4
+llffhold = 8
+N_rand = 2048 #4096
+N_samples = 64
+N_importance = 64 #128
+use_viewdirs = True
+raw_noise_std = 1e0
+no_ndc = True
+colmap_depth = True
+depth_loss = True
+depth_lambda = 0.1
+i_testset = 500
+i_video = 10000
+N_iters = 50000
+chunk = 8192 #32768
+lidar_depth_only = True
