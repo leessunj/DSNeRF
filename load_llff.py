@@ -4,6 +4,7 @@ from pathlib import Path
 from colmapUtils.read_write_model import *
 from colmapUtils.read_write_dense import *
 import json
+from llff.poses.pose_utils import get_poses_bound_npy, get_poses_bound_lidar
 
 
 ########## Slightly modified version of LLFF data loading code 
@@ -61,11 +62,16 @@ def _minify(basedir, factors=[], resolutions=[]):
         print('Done')
             
         
-        
-        
-def _load_data(basedir, factor=None, width=None, height=None, load_imgs=True):
-    
-    poses_arr = np.load(os.path.join(basedir, 'poses_bounds.npy'))
+
+def _load_data(basedir, factor=None, width=None, height=None, load_imgs=True, use_lidar=False):
+    if use_lidar:
+        if not os.path.exists(os.path.join(basedir, 'poses_bounds_lidar.npy')):
+            get_poses_bound_lidar(basedir)
+        poses_arr=np.load(os.path.join(basedir, 'poses_bounds_lidar.npy'))
+    else:
+        if not os.path.exists(os.path.join(basedir, 'poses_bounds.npy')):
+            get_poses_bound_npy(basedir)
+        poses_arr = np.load(os.path.join(basedir, 'poses_bounds.npy'))
     poses = poses_arr[:, :-2].reshape([-1, 3, 5]).transpose([1,2,0]) # 3 x 5 x N
     bds = poses_arr[:, -2:].transpose([1,0])
     
@@ -336,7 +342,7 @@ def get_poses(images):
         poses.append(c2w)
     return np.array(poses)
 
-def load_colmap_depth(basedir, factor=8, bd_factor=.75):
+def load_colmap_depth(basedir, factor=8, bd_factor=.75,extra_depth=False):
     data_file = Path(basedir) / 'colmap_depth.npy'
     
     images = read_images_binary(Path(basedir) / 'sparse' / '0' / 'images.bin')
@@ -382,6 +388,120 @@ def load_colmap_depth(basedir, factor=8, bd_factor=.75):
         else:
             print(id_im, len(depth_list))
     # json.dump(data_list, open(data_file, "w"))
+    np.save(data_file, data_list)
+    if extra_depth and os.path.exists(Path(basedir) / 'lidar_im3d.npy'):
+        print("ready to get lidar_im3d")
+        extra_data = load_lidar_depth(basedir, poses, Err_mean, sc, bds_raw, factor)
+        cnt = 0
+        for i in range(len(images)):
+            if extra_data[i]:
+                cnt += len(data_list[i]['depth'])
+                data_list[i]["depth"] = np.concatenate((data_list[i]["depth"], extra_data[i]["depth"]))
+                data_list[i]["coord"] = np.concatenate((data_list[i]["coord"], extra_data[i]["coord"]))
+                data_list[i]["error"] = np.concatenate((data_list[i]["error"], extra_data[i]["error"]))
+        print("extra data:", cnt)
+    else:
+        print("No extra depth info")
+    return data_list
+
+
+def load_lidar_only(basedir, factor=8, bd_factor=.75):
+    images = read_images_binary(Path(basedir) / 'sparse' / '0' / 'images.bin')
+    points = read_points3d_binary(Path(basedir) / 'sparse' / '0' / 'points3D.bin')
+
+    Errs = np.array([point3D.error for point3D in points.values()])
+    Err_mean = np.mean(Errs)
+    print("Mean Projection Error:", Err_mean)
+
+    poses = get_poses(images)
+    _, bds_raw, _ = _load_data(basedir, factor=factor, use_lidar=True)  # factor=8 downsamples original imgs by 8x
+    bds_raw = np.moveaxis(bds_raw, -1, 0).astype(np.float32)
+    sc = 1. if bd_factor is None else 1. / (bds_raw.min() * bd_factor)
+
+    near = np.ndarray.min(bds_raw) * .9 * sc
+    far = np.ndarray.max(bds_raw) * 1. * sc
+    print('near/far:', near, far)
+
+    return load_lidar_depth(basedir, poses, Err_mean, sc, bds_raw, factor)
+
+
+def load_lidar_depth(basedir, poses, colmap_err, sc, bds_raw, factor=8):
+    p3 = np.load(Path(basedir) / "lidar_im3d.npy", allow_pickle=True)  # 3d points array (numbers, )
+    p2 = np.load(Path(basedir) / "lidar_im2d.npy", allow_pickle=True)  # (img, ) img[(X,Y)]=err
+    data_file = Path(basedir) / 'lidar_depth.npy'
+
+    print("**bds:", bds_raw, "scale", sc)
+    # print('near/far:', near, far)
+
+    data_list = []
+    for ind in range(len(p2)):  # ind=image_id
+        depth_list = []
+        coord_list = []
+        weight_list = []
+        if p2[ind]:
+            err_mean = np.mean(np.array(list(p2[ind].values()))[:, 0])
+        # print("**err:",err_mean, colmap_err)
+        min_depth = 4.847076433633877
+        # bds_raw와 평균낼까??
+        for i, pt2d in enumerate(p2[ind].keys()):
+            point2D = np.array(pt2d)
+            depth = (poses[ind, :3, 2].T @ (p3[p2[ind][pt2d][1]]['xyz'] - poses[ind, :3, 3])) * sc
+            if depth < bds_raw[ind, 0] * sc or depth > bds_raw[ind, 1] * sc:
+                continue
+            err = p2[ind][pt2d][0]
+            weight = 2 * np.exp(-(err / err_mean) ** 2)
+            depth_list.append(depth)
+            coord_list.append(point2D / factor)
+            weight_list.append(weight)
+        if len(depth_list) > 0:
+            print("additional data", ind, len(depth_list), np.min(depth_list), np.max(depth_list), np.mean(depth_list))
+            data_list.append(
+                {"depth": np.array(depth_list), "coord": np.array(coord_list), "error": np.array(weight_list)})
+        else:
+            print(ind, len(depth_list))
+            # data_list.append([])
+            data_list.append(
+                {"depth": np.array([]), "coord": np.array([[]]).reshape(-1, 2), "error": np.array([])})
+    np.save(data_file, data_list)
+    return data_list
+
+
+def before_mod_load_lidar_depth(basedir, poses, colmap_err, sc, bds_raw, factor=8):
+    lidar_info = np.load(Path(basedir) / 'lidar_info.npy', allow_pickle=True)
+
+    data_file = Path(basedir) / 'lidar_depth.npy'
+
+    # near = np.ndarray.min(bds_raw) * .9 * sc
+    # far = np.ndarray.max(bds_raw) * 1. * sc
+    print("**bds:", bds_raw, "scale", sc)
+    # print('near/far:', near, far)
+
+    data_list = []
+    for ind in range(len(lidar_info)):
+        depth_list = []
+        coord_list = []
+        weight_list = []
+        err_mean = np.mean(lidar_info[ind]['error'])
+        print("**err:", err_mean, colmap_err)
+        min_depth = 4.847076433633877
+        # bds_raw와 평균낼까??
+        for i in range(len(lidar_info[ind])):
+            point2D = np.array(lidar_info[ind]['img2d'][i])
+            depth = (poses[ind, :3, 2].T @ (lidar_info[ind]['xyz'][i] - poses[ind, :3, 3])) * sc
+            if depth < bds_raw[ind, 0] * sc or depth > bds_raw[ind, 1] * sc:
+                continue
+            err = lidar_info[ind]['error'][i]
+            weight = 2 * np.exp(-(err / err_mean) ** 2)
+            depth_list.append(depth)
+            coord_list.append(point2D / factor)
+            weight_list.append(weight)
+        if len(depth_list) > 0:
+            print("additional data", ind, len(depth_list), np.min(depth_list), np.max(depth_list), np.mean(depth_list))
+            data_list.append(
+                {"depth": np.array(depth_list), "coord": np.array(coord_list), "error": np.array(weight_list)})
+        else:
+            print(ind, len(depth_list))
+            data_list.append([])
     np.save(data_file, data_list)
     return data_list
 

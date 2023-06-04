@@ -4,9 +4,56 @@ import sys
 import imageio
 import skimage.transform
 
+from pathlib import Path
 from llff.poses.colmap_wrapper import run_colmap
 import llff.poses.colmap_read_model as read_model
 
+def get_poses_bound_npy(basedir):
+    poses, pts3d, perm= load_colmap_data(basedir)
+    save_poses(basedir, poses, pts3d, perm)
+
+def get_poses_bound_lidar(basedir):
+    camerasfile = os.path.join(basedir, 'sparse/0/cameras.bin')
+    camdata = read_model.read_cameras_binary(camerasfile)
+
+    list_of_keys = list(camdata.keys())
+    cam = camdata[list_of_keys[0]]
+
+    h, w, f = cam.height, cam.width, cam.params[0]
+    hwf = np.array([h, w, f]).reshape([3, 1])
+
+    imagesfile = os.path.join(basedir, 'sparse/0/images.bin')
+    imdata = read_model.read_images_binary(imagesfile)
+
+    w2c_mats = []
+    bottom = np.array([0, 0, 0, 1.]).reshape([1, 4])
+
+    pt2d = np.load(Path(basedir) / "lidar_im2d.npy", allow_pickle=True)
+    names = [imdata[k].name for k in imdata]# if pt2d[k-1]]
+    print('Images #', len(names))
+    perm = np.argsort(names)
+    for k in imdata:
+        im = imdata[k]
+        R = im.qvec2rotmat()
+        t = im.tvec.reshape([3, 1])
+        m = np.concatenate([np.concatenate([R, t], 1), bottom], 0)
+        w2c_mats.append(m)
+
+    w2c_mats = np.stack(w2c_mats, 0)
+    c2w_mats = np.linalg.inv(w2c_mats)
+
+    poses = c2w_mats[:, :3, :4].transpose([1, 2, 0])
+    poses = np.concatenate([poses, np.tile(hwf[..., np.newaxis], [1, 1, poses.shape[-1]])], 1)
+
+    if os.path.exists(Path(basedir) /"lidar_im3d.npy"):
+        pts3d = np.load(Path(basedir) /"lidar_im3d.npy",allow_pickle=True)
+
+    else:
+        print("there's no lidar_3d points")
+
+    poses = np.concatenate([poses[:, 1:2, :], poses[:, 0:1, :], -poses[:, 2:3, :], poses[:, 3:4, :], poses[:, 4:5, :]],1)
+
+    save_poses(basedir, poses, pts3d, perm,sub="_lidar")
 
 def load_colmap_data(realdir):
     
@@ -53,13 +100,18 @@ def load_colmap_data(realdir):
     return poses, pts3d, perm
 
 
-def save_poses(basedir, poses, pts3d, perm):
+def save_poses(basedir, poses, pts3d, perm,sub=""):
     pts_arr = []
     vis_arr = []
-    for k in pts3d:
-        pts_arr.append(pts3d[k].xyz)
+    for i, k in enumerate(pts3d):
         cams = [0] * poses.shape[-1]
-        for ind in pts3d[k].image_ids:
+        if sub:
+            pts_arr.append(k['xyz'])
+            pcams = k['cams']
+        else:
+            pts_arr.append(pts3d[k].xyz)
+            pcams = pts3d[k].image_ids
+        for ind in pcams:
             if len(cams) < ind - 1:
                 print('ERROR: the correct camera poses for current points cannot be accessed')
                 return
@@ -84,10 +136,8 @@ def save_poses(basedir, poses, pts3d, perm):
         
         save_arr.append(np.concatenate([poses[..., i].ravel(), np.array([close_depth, inf_depth])], 0))
     save_arr = np.array(save_arr)
-    
-    np.save(os.path.join(basedir, 'poses_bounds.npy'), save_arr)
-            
 
+    np.save(os.path.join(basedir, f'poses_bounds{sub}.npy'), save_arr)
 
 
 def minify_v0(basedir, factors=[], resolutions=[]):

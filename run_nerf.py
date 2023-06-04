@@ -14,7 +14,7 @@ import matplotlib.pyplot as plt
 
 from run_nerf_helpers import *
 
-from load_llff import load_llff_data, load_colmap_depth, load_colmap_llff
+from load_llff import load_llff_data, load_colmap_depth, load_colmap_llff, load_lidar_only
 from load_dtu import load_dtu_data
 
 from loss import SigmaLoss
@@ -509,6 +509,13 @@ def config_parser():
     parser.add_argument("--ft_path", type=str, default=None, 
                         help='specific weights npy file to reload for coarse network')
 
+    # Add new options for LiDAR
+    parser.add_argument("--extra_depth", action='store_true',
+                        help="Use depth supervision by lidar also.")
+    parser.add_argument("--lidar_depth_only", action='store_true',
+                        help="Use only depth by lidar.")
+
+
     # rendering options
     parser.add_argument("--N_samples", type=int, default=64, 
                         help='number of coarse samples per ray')
@@ -650,8 +657,11 @@ def train():
             far = 1.
         print('NEAR FAR', near, far)
     elif args.dataset_type == 'llff':
-        if args.colmap_depth:
-            depth_gts = load_colmap_depth(args.datadir, factor=args.factor, bd_factor=.75)
+        if args.lidar_depth_only:
+            depth_gts = load_lidar_only(args.datadir, factor=args.factor, bd_factor=.75)
+
+        elif args.colmap_depth:
+            depth_gts = load_colmap_depth(args.datadir, factor=args.factor, bd_factor=.75, extra_depth=args.extra_depth)
         images, poses, bds, render_poses, i_test = load_llff_data(args.datadir, args.factor,
                                                                   recenter=True, bd_factor=.75,
                                                                   spherify=args.spherify)
@@ -831,6 +841,8 @@ def train():
             print('get depth rays')
             rays_depth_list = []
             for i in i_train:
+                if not depth_gts[i] or len(depth_gts[i]['coord'])<2:
+                    continue
                 rays_depth = np.stack(get_rays_by_coord_np(H, W, focal, poses[i,:3,:4], depth_gts[i]['coord']), axis=0) # 2 x N x 3
                 # print(rays_depth.shape)
                 rays_depth = np.transpose(rays_depth, [1,0,2])
@@ -872,7 +884,7 @@ def train():
     print('VAL views are', i_val)
 
     # Summary writers
-    # writer = SummaryWriter(os.path.join(basedir, 'summaries', expname))
+    writer = SummaryWriter(os.path.join(basedir, 'summaries', expname), flush_secs=1)
     
     start = start + 1
     for i in trange(start, N_iters):
@@ -1072,58 +1084,21 @@ def train():
             os.makedirs(testsavedir, exist_ok=True)
             print('test poses shape', poses[i_test].shape)
             with torch.no_grad():
-                rgbs, disps = render_path(torch.Tensor(poses[i_test]).to(device), hwf, args.chunk, render_kwargs_test, gt_imgs=images[i_test], savedir=testsavedir)
+                rgbs, disps = render_path(poses[i_test], hwf, args.chunk, render_kwargs_test, gt_imgs=images[i_test], savedir=testsavedir)
             print('Saved test set')
 
             filenames = [os.path.join(testsavedir, '{:03d}.png'.format(k)) for k in range(len(i_test))]
 
             test_loss = img2mse(torch.Tensor(rgbs), images[i_test])
             test_psnr = mse2psnr(test_loss)
+            writer.add_scalar('eval/loss', test_loss, global_step)
+            writer.add_scalar('eval/avg_psnr', test_psnr, global_step)
 
-    
         if i%args.i_print==0:
             tqdm.write(f"[TRAIN] Iter: {i} Loss: {loss.item()}  PSNR: {psnr.item()}")
-        """
-            print(expname, i, psnr.numpy(), loss.numpy(), global_step.numpy())
-            print('iter time {:.05f}'.format(dt))
-
-            with tf.contrib.summary.record_summaries_every_n_global_steps(args.i_print):
-                tf.contrib.summary.scalar('loss', loss)
-                tf.contrib.summary.scalar('psnr', psnr)
-                tf.contrib.summary.histogram('tran', trans)
-                if args.N_importance > 0:
-                    tf.contrib.summary.scalar('psnr0', psnr0)
-
-
-            if i%args.i_img==0:
-
-                # Log a rendered validation view to Tensorboard
-                img_i=np.random.choice(i_val)
-                target = images[img_i]
-                pose = poses[img_i, :3,:4]
-                with torch.no_grad():
-                    rgb, disp, acc, extras = render(H, W, focal, chunk=args.chunk, c2w=pose,
-                                                        **render_kwargs_test)
-
-                psnr = mse2psnr(img2mse(rgb, target))
-
-                with tf.contrib.summary.record_summaries_every_n_global_steps(args.i_img):
-
-                    tf.contrib.summary.image('rgb', to8b(rgb)[tf.newaxis])
-                    tf.contrib.summary.image('disp', disp[tf.newaxis,...,tf.newaxis])
-                    tf.contrib.summary.image('acc', acc[tf.newaxis,...,tf.newaxis])
-
-                    tf.contrib.summary.scalar('psnr_holdout', psnr)
-                    tf.contrib.summary.image('rgb_holdout', target[tf.newaxis])
-
-
-                if args.N_importance > 0:
-
-                    with tf.contrib.summary.record_summaries_every_n_global_steps(args.i_img):
-                        tf.contrib.summary.image('rgb0', to8b(extras['rgb0'])[tf.newaxis])
-                        tf.contrib.summary.image('disp0', extras['disp0'][tf.newaxis,...,tf.newaxis])
-                        tf.contrib.summary.image('z_std', extras['z_std'][tf.newaxis,...,tf.newaxis])
-        """
+            writer.add_scalar('train/loss', loss.detach().cpu().numpy(), global_step)
+            writer.add_scalar('train/avg_psnr', psnr.detach().cpu().numpy(), global_step)
+            writer.add_scalar('train/lr', new_lrate, global_step)
 
         global_step += 1
 
