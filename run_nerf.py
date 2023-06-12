@@ -145,7 +145,7 @@ def render(H, W, focal, chunk=1024*32, rays=None, c2w=None, ndc=True,
     k_extract = ['rgb_map', 'disp_map', 'acc_map', 'depth_map']
     ret_list = [all_ret[k] for k in k_extract]
     ret_dict = {k : all_ret[k] for k in all_ret if k not in k_extract}
-    return ret_list + [ret_dict]
+    return ret_list + [ret_dict, rays.cpu().numpy()]
 
 
 def render_path(render_poses, hwf, chunk, render_kwargs, gt_imgs=None, savedir=None, render_factor=0):
@@ -160,14 +160,15 @@ def render_path(render_poses, hwf, chunk, render_kwargs, gt_imgs=None, savedir=N
 
     rgbs = []
     disps = []
-
+    extra_file = []
     t = time.time()
     for i, c2w in enumerate(tqdm(render_poses)):
         print(i, time.time() - t)
         t = time.time()
-        rgb, disp, acc, depth, extras = render(H, W, focal, chunk=chunk, c2w=c2w[:3,:4], retraw=True, **render_kwargs)
+        rgb, disp, acc, depth, extras, rays = render(H, W, focal, chunk=chunk, c2w=c2w[:3,:4], retraw=True, **render_kwargs)
         rgbs.append(rgb.cpu().numpy())
         disps.append(disp.cpu().numpy())
+        extra_file.append(rays)
         if i==0:
             print(rgb.shape, disp.shape)
 
@@ -195,7 +196,7 @@ def render_path(render_poses, hwf, chunk, render_kwargs, gt_imgs=None, savedir=N
     rgbs = np.stack(rgbs, 0)
     disps = np.stack(disps, 0)
 
-    return rgbs, disps
+    return rgbs, disps,extra_file
 
 def render_test_ray(rays_o, rays_d, hwf, ndc, near, far, use_viewdirs, N_samples, network, network_query_fn, **kwargs):
     H, W, focal = hwf
@@ -609,6 +610,10 @@ def config_parser():
                         help='id of scenes used to test')
     parser.add_argument("--colmap_depth", action='store_true',
                         help="Use depth supervision by colmap.")
+    parser.add_argument("--extra_depth", action='store_true',
+                        help="Use depth supervision by lidar.")
+    parser.add_argument("--lidar_depth_only", action='store_true',
+                        help="Use depth supervision by lidar.")
     parser.add_argument("--depth_loss", action='store_true',
                         help="Use depth supervision by colmap - depth loss.")
     parser.add_argument("--depth_lambda", type=float, default=0.1,
@@ -802,13 +807,14 @@ def train():
                 print("Estimated depth:", depth_maps[0].cpu().numpy())
                 print(depth_gts[index_pose]['coord'])
             else:
-                rgbs, disps = render_path(render_poses, hwf, args.chunk, render_kwargs_test, gt_imgs=images, savedir=testsavedir, render_factor=args.render_factor)
+                rgbs, disps,extra = render_path(render_poses, hwf, args.chunk, render_kwargs_test, gt_imgs=images, savedir=testsavedir, render_factor=args.render_factor)
                 print('Done rendering', testsavedir)
                 imageio.mimwrite(os.path.join(testsavedir, 'rgb.mp4'), to8b(rgbs), fps=30, quality=8)
                 disps[np.isnan(disps)] = 0
                 print('Depth stats', np.mean(disps), np.max(disps), np.percentile(disps, 95))
                 imageio.mimwrite(os.path.join(testsavedir, 'disp.mp4'), to8b(disps / np.percentile(disps, 95)), fps=30, quality=8)
-
+                np.save(os.path.join(testsavedir, 'extra'), extra)
+                print("finished saving")
             
             return
 
@@ -965,7 +971,7 @@ def train():
         # timer_concate = time.perf_counter()
 
 
-        rgb, disp, acc, depth, extras = render(H, W, focal, chunk=args.chunk, rays=batch_rays,
+        rgb, disp, acc, depth, extras,_ = render(H, W, focal, chunk=args.chunk, rays=batch_rays,
                                                 verbose=i < 10, retraw=True,
                                                 **render_kwargs_train)
         # timer_iter = time.perf_counter()
@@ -1084,7 +1090,7 @@ def train():
             os.makedirs(testsavedir, exist_ok=True)
             print('test poses shape', poses[i_test].shape)
             with torch.no_grad():
-                rgbs, disps = render_path(poses[i_test], hwf, args.chunk, render_kwargs_test, gt_imgs=images[i_test], savedir=testsavedir)
+                rgbs, disps,_ = render_path(poses[i_test], hwf, args.chunk, render_kwargs_test, gt_imgs=images[i_test], savedir=testsavedir)
             print('Saved test set')
 
             filenames = [os.path.join(testsavedir, '{:03d}.png'.format(k)) for k in range(len(i_test))]
